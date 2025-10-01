@@ -41,7 +41,7 @@ llm-rag-poc/
 
 #### Clone repository
 ```
-git clone <your-repo-url>
+git clone https://github.com/fatahsofteng/llm-rag-poc.git
 cd llm-rag-poc
 ```
 
