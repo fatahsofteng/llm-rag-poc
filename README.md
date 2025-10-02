@@ -46,47 +46,73 @@ cd llm-rag-poc
 ```
 
 #### Create virtual environment
-```
+```bash
 python -m venv venv
 source venv/bin/activate  
+
 # Windows: 
 venv\Scripts\activate
 ```
 
 # Install dependencies
-```
+```bash
 pip install -r requirements.txt
 ```
 
 ### 3. Build & Start PostgreSQL
 
 #### Build custom image (first time only, ~8-10 minutes)
-```
-docker-compose build
+```bash
+docker-compose build --no-cache
 ```
 
 #### Start container
-```
+```bash
 docker-compose up -d
 ```
 
-#### Check logs
+#### Verify container running
+```bash
+docker-compose ps
+
+# Expected:
+# NAME          STATUS         PORTS
+# rag_postgres  Up (healthy)   0.0.0.0:5432->5432/tcp
 ```
-docker-compose logs -f postgres
+
+#### Check logs
+```bash
+docker-compose logs postgres
 ```
 
 #### Verify extensions installed
-```
+```bash
 docker exec rag_postgres psql -U rag_user -d rag_db -c "\dx"
-# Expected: vector, pg_bigm
+
+# The expected results must be there:
+# pg_bigm | 1.2 | public
+# vector  | 0.5.1 | public
+```
+
+#### Verify tables created
+```bash
+docker exec rag_postgres psql -U rag_user -d rag_db -c "\dt"
+
+# Expected 5 tables:
+# collections
+# vector_embeddings
+# fulltext_docs
+# vector_tombstones
+# fulltext_deleted
 ```
 
 ### 4. Run FastAPI
 
 ```bash
 python app/main.py
-# Server running at http://localhost:8000
-# API docs at http://localhost:8000/docs
+
+# Expected:
+# INFO: Uvicorn running on http://0.0.0.0:8000
 ```
 
 ### 5. Test API
