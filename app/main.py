@@ -1,41 +1,37 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import os
+from fastapi import FastAPI, HTTPException, Depends
+from sqlmodel import Session, select, text
 from typing import List, Optional
-import json
+from datetime import date, datetime
+from dotenv import load_dotenv
+import os
 
-app = FastAPI(title="RAG POC", version="0.1.0")
+# Load environment variables
+load_dotenv()
 
-# Database connection
-def get_db():
-    return psycopg2.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", "5432"),
-        user=os.getenv("DB_USER", "rag_user"),
-        password=os.getenv("DB_PASS", "rag_pass"),
-        database=os.getenv("DB_NAME", "rag_db")
-    )
+from .database import get_session
+from .models import FulltextDocs, VectorEmbeddings
+from pydantic import BaseModel
 
-# Pydantic models
-class Document(BaseModel):
+app = FastAPI(title="RAG POC with SQLModel", version="0.2.0")
+
+# Request/Response models
+class DocumentCreate(BaseModel):
     collection_id: str
     source_id: str = "default_source"
     knowledge_id: Optional[str] = None
     content: str
-    channels: List[str] = ["TWM"]  # TWM, TDS, or both
+    channels: List[str] = ["TWM"]
     action_code: Optional[str] = None
-    effective_from: Optional[str] = None  # ISO format: 2024-01-01
+    effective_from: Optional[str] = None
     effective_to: Optional[str] = None
     metadata: Optional[dict] = {}
 
 class SearchQuery(BaseModel):
     query: str
     collection_id: Optional[str] = None
-    channels: List[str] = []  # Filter by channels: TWM, TDS
-    search_type: str = "fulltext"  # fulltext, vector, hybrid
-    limit: int = 20  # Epic requirement: top 20 results
+    channels: List[str] = []
+    search_type: str = "fulltext"
+    limit: int = 20
 
 class SearchResult(BaseModel):
     chunk_id: str
@@ -45,137 +41,110 @@ class SearchResult(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "RAG POC API", "status": "running"}
+    return {"message": "RAG POC API with SQLModel", "status": "running", "version": "0.2.0"}
 
 @app.get("/health")
-def health_check():
+def health_check(session: Session = Depends(get_session)):
     """Check database connection"""
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.close()
-        conn.close()
+        session.exec(text("SELECT 1"))
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
 @app.post("/ingest/fulltext")
-def ingest_fulltext(doc: Document):
-    """Insert document into full-text search table"""
+def ingest_fulltext(doc: DocumentCreate, session: Session = Depends(get_session)):
+    """Insert document into full-text search table using SQLModel"""
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        
         chunk_id = f"{doc.collection_id}_{hash(doc.content) % 10000}"
-        build_id = "build_0"  # In production, this comes from Airflow DAG
         
-        cursor.execute("""
-            INSERT INTO fulltext_docs (
-                collection_id, source_id, knowledge_id, chunk_id, 
-                channels, action_code, build_id, content, metadata,
-                effective_from, effective_to, created_by
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (
-            doc.collection_id, doc.source_id, doc.knowledge_id, chunk_id,
-            doc.channels, doc.action_code, build_id, doc.content, 
-            json.dumps(doc.metadata),
-            doc.effective_from, doc.effective_to, 'api_user'
-        ))
+        # Parse dates
+        effective_from = date.fromisoformat(doc.effective_from) if doc.effective_from else None
+        effective_to = date.fromisoformat(doc.effective_to) if doc.effective_to else None
         
-        result_id = cursor.fetchone()[0]
-        conn.commit()
-        cursor.close()
-        conn.close()
+        db_doc = FulltextDocs(
+            collection_id=doc.collection_id,
+            source_id=doc.source_id,
+            knowledge_id=doc.knowledge_id,
+            chunk_id=chunk_id,
+            channels=doc.channels,
+            action_code=doc.action_code,
+            content=doc.content,
+            meta=doc.metadata or {},  # Changed: metadata → meta
+            effective_from=effective_from,
+            effective_to=effective_to,
+            created_by="api_user"
+        )
         
-        return {"status": "success", "id": result_id, "chunk_id": chunk_id}
+        session.add(db_doc)
+        session.commit()
+        session.refresh(db_doc)
+        
+        return {"status": "success", "id": db_doc.id, "chunk_id": chunk_id}
     except Exception as e:
+        session.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search/fulltext", response_model=List[SearchResult])
-def search_fulltext(query: SearchQuery):
-    """Full-text search using pg_bigm with channel & date filtering"""
+def search_fulltext(query: SearchQuery, session: Session = Depends(get_session)):
+    """Full-text search using pg_bigm with SQLModel"""
     try:
-        conn = get_db()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Enable pg_bigm similarity for this session
-        cursor.execute("SET pg_bigm.similarity_threshold = 0.3;")
-        
-        # Base query with pg_bigm similarity
-        sql = """
+        # Use raw SQL for complex query with pg_bigm
+        sql = text("""
             SELECT 
-                f.chunk_id,
-                f.content,
-                f.metadata,
-                f.channels,
-                f.effective_from,
-                f.effective_to,
-                bigm_similarity(f.content, %s) as score
-            FROM fulltext_docs f
-            WHERE f.content LIKE %s
-        """
-        params = [query.query, f"%{query.query}%"]
+                chunk_id,
+                content,
+                metadata,
+                bigm_similarity(content, :query) as score
+            FROM fulltext_docs
+            WHERE content LIKE :like_query
+        """)
         
-        # Filter by collection
+        params = {"query": query.query, "like_query": f"%{query.query}%"}
+        
+        # Build dynamic filters
+        filters = []
         if query.collection_id:
-            sql += " AND f.collection_id = %s"
-            params.append(query.collection_id)
+            filters.append("collection_id = :collection_id")
+            params["collection_id"] = query.collection_id
         
-        # CRITICAL: Filter by channels (TWM, TDS)
         if query.channels:
-            sql += " AND f.channels && %s"
-            params.append(query.channels)
+            filters.append("channels && :channels")
+            params["channels"] = query.channels
         
-        # CRITICAL: QA filtering - exclude expired documents
-        sql += """
-            AND (
-                f.effective_from IS NULL 
-                OR f.effective_from <= CURRENT_DATE
-            )
-            AND (
-                f.effective_to IS NULL 
-                OR f.effective_to >= CURRENT_DATE
-            )
-        """
+        # Date filtering
+        filters.append("(effective_from IS NULL OR effective_from <= CURRENT_DATE)")
+        filters.append("(effective_to IS NULL OR effective_to >= CURRENT_DATE)")
         
-        sql += " ORDER BY score DESC LIMIT %s"
-        params.append(query.limit)
+        # Combine filters
+        if filters:
+            sql = text(str(sql) + " AND " + " AND ".join(filters) + " ORDER BY score DESC LIMIT :limit")
         
-        cursor.execute(sql, params)
-        results = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        params["limit"] = query.limit
+        
+        # Bind parameters
+        sql = sql.bindparams(**params)
+        
+        results = session.exec(sql).all()
         
         return [
             SearchResult(
-                chunk_id=r['chunk_id'],
-                content=r['content'],
-                score=float(r['score']) if r['score'] else 0.0,
-                metadata=r['metadata'] or {}
+                chunk_id=row[0],
+                content=row[1],
+                score=float(row[3]) if row[3] else 0.0,
+                metadata=row[2] or {}
             )
-            for r in results
+            for row in results
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/stats")
-def get_stats():
-    """Get database statistics"""
+def get_stats(session: Session = Depends(get_session)):
+    """Get database statistics using SQLModel"""
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM fulltext_docs")
-        fulltext_count = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM vector_embeddings")
-        vector_count = cursor.fetchone()[0]
-        
-        cursor.close()
-        conn.close()
+        fulltext_count = len(session.exec(select(FulltextDocs)).all())
+        vector_count = len(session.exec(select(VectorEmbeddings)).all())
         
         return {
             "fulltext_docs": fulltext_count,
@@ -186,4 +155,8 @@ def get_stats():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("APP_PORT", 8000))
+    )

@@ -51,3 +51,6 @@ htmlcov/
 # Database
 *.db
 *.sqlite3
+
+# Alembic
+alembic.ini
